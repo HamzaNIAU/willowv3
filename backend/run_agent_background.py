@@ -19,6 +19,11 @@ from dramatiq.brokers.redis import RedisBroker
 import os
 from services.langfuse import langfuse
 from utils.retry import retry
+from utils.status_tracker import StatusTracker, ProgressReporter
+from utils.error_handler import (
+    ErrorHandler, ErrorType, ErrorSeverity, AgentRunStatus,
+    KortixError, TransientError, wrap_with_error_handling
+)
 
 import sentry_sdk
 from typing import Dict, Any
@@ -115,6 +120,10 @@ async def run_agent_background(
         "target_agent_id": target_agent_id,
     })
     
+    # Initialize status tracker
+    status_tracker = StatusTracker(agent_run_id, thread_id, project_id)
+    await status_tracker.initialize()
+    
     effective_model = model_name
     if model_name == "anthropic/claude-sonnet-4-20250514" and agent_config and agent_config.get('model'):
         agent_model = agent_config['model']
@@ -174,12 +183,23 @@ async def run_agent_background(
 
     trace = langfuse.trace(name="agent_run", id=agent_run_id, session_id=thread_id, metadata={"project_id": project_id, "instance_id": instance_id})
     try:
+        # Update status to setting up
+        await status_tracker.update_status(
+            AgentRunStatus.INITIALIZING,
+            "Setting up Redis channels and control signals"
+        )
+        
         # Setup Pub/Sub listener for control signals
         pubsub = await redis.create_pubsub()
         try:
             await retry(lambda: pubsub.subscribe(instance_control_channel, global_control_channel))
         except Exception as e:
             logger.error(f"Redis failed to subscribe to control channels: {e}", exc_info=True)
+            await status_tracker.update_status(
+                AgentRunStatus.FAILED,
+                "Failed to initialize Redis channels",
+                error=str(e)
+            )
             raise e
 
         logger.debug(f"Subscribed to control channels: {instance_control_channel}, {global_control_channel}")
@@ -187,9 +207,15 @@ async def run_agent_background(
 
         # Ensure active run key exists and has TTL
         await redis.set(instance_active_key, "running", ex=redis.REDIS_KEY_TTL)
+        
+        # Update status to ready
+        await status_tracker.update_status(
+            AgentRunStatus.READY,
+            "Agent initialization complete, starting execution"
+        )
 
 
-        # Initialize agent generator
+        # Initialize agent generator with status tracker
         agent_gen = run_agent(
             thread_id=thread_id, project_id=project_id, stream=stream,
             model_name=effective_model,
@@ -198,7 +224,8 @@ async def run_agent_background(
             agent_config=agent_config,
             trace=trace,
             is_agent_builder=is_agent_builder,
-            target_agent_id=target_agent_id
+            target_agent_id=target_agent_id,
+            status_tracker=status_tracker  # Pass status tracker to agent runner
         )
 
         final_status = "running"
@@ -210,6 +237,10 @@ async def run_agent_background(
             if stop_signal_received:
                 logger.info(f"Agent run {agent_run_id} stopped by signal.")
                 final_status = "stopped"
+                await status_tracker.update_status(
+                    AgentRunStatus.STOPPED,
+                    "Agent run stopped by user request"
+                )
                 trace.span(name="agent_run_stopped").end(status_message="agent_run_stopped", level="WARNING")
                 break
 
@@ -219,6 +250,16 @@ async def run_agent_background(
             pending_redis_operations.append(asyncio.create_task(redis.publish(response_channel, "new")))
             total_responses += 1
 
+            # Update status based on response type
+            if response.get('type') == 'tool':
+                tool_name = response.get('content', {}).get('name', 'unknown')
+                await status_tracker.start_tool_execution(tool_name)
+            elif response.get('type') == 'assistant':
+                await status_tracker.update_status(
+                    AgentRunStatus.STREAMING,
+                    "Streaming assistant response to user"
+                )
+
             # Check for agent-signaled completion or error
             if response.get('type') == 'status':
                  status_val = response.get('status')
@@ -227,6 +268,19 @@ async def run_agent_background(
                      final_status = status_val
                      if status_val == 'failed' or status_val == 'stopped':
                          error_message = response.get('message', f"Run ended with status: {status_val}")
+                     
+                     # Update status tracker
+                     if status_val == 'completed':
+                         await status_tracker.update_status(
+                             AgentRunStatus.COMPLETED,
+                             "Agent run completed successfully"
+                         )
+                     elif status_val == 'failed':
+                         await status_tracker.update_status(
+                             AgentRunStatus.FAILED,
+                             "Agent run failed",
+                             error=error_message
+                         )
                      break
 
         # If loop finished without explicit completion/error/stop signal, mark as completed
@@ -291,6 +345,10 @@ async def run_agent_background(
             logger.warning(f"Failed to publish ERROR signal: {str(e)}")
 
     finally:
+        # Cleanup status tracker
+        if 'status_tracker' in locals():
+            await status_tracker.cleanup()
+        
         # Cleanup stop checker task
         if stop_checker and not stop_checker.done():
             stop_checker.cancel()

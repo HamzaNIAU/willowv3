@@ -496,14 +496,22 @@ export function useAgentStream(
         if (!isMountedRef.current) return; // Check mount status after async call
 
         if (agentStatus.status !== 'running') {
-          console.warn(
-            `[useAgentStream] Agent run ${runId} is not in running state (status: ${agentStatus.status}). Cannot start stream.`,
-          );
-          setError(`Agent run is not running (status: ${agentStatus.status})`);
-          finalizeStream(
-            mapAgentStatus(agentStatus.status) || 'agent_not_running',
-            runId,
-          );
+          // If the run is completed, this is expected - not an error
+          if (agentStatus.status === 'completed') {
+            console.debug(
+              `[useAgentStream] Agent run ${runId} is already completed. No stream needed.`,
+            );
+            finalizeStream('completed', runId);
+          } else {
+            console.warn(
+              `[useAgentStream] Agent run ${runId} is not in running state (status: ${agentStatus.status}). Cannot start stream.`,
+            );
+            setError(`Agent run is not running (status: ${agentStatus.status})`);
+            finalizeStream(
+              mapAgentStatus(agentStatus.status) || 'agent_not_running',
+              runId,
+            );
+          }
           return;
         }
 
@@ -545,6 +553,17 @@ export function useAgentStream(
         if (!isMountedRef.current) return; // Check mount status after async call
 
         const errorMessage = err instanceof Error ? err.message : String(err);
+        
+        // Check if this is a "not running" error for a completed run - not really an error
+        const isNotRunningError = errorMessage.includes('is not running');
+        if (isNotRunningError) {
+          console.debug(
+            `[useAgentStream] Agent run ${runId} is not running (likely completed).`,
+          );
+          finalizeStream('completed', runId);
+          return;
+        }
+
         console.error(
           `[useAgentStream] Error initiating stream for ${runId}: ${errorMessage}`,
         );

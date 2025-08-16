@@ -29,6 +29,7 @@ import sys
 from services import email_api
 from triggers import api as triggers_api
 from services import api_keys_api
+from api_health import router as health_router
 
 
 if sys.platform == "win32":
@@ -191,6 +192,9 @@ api_router.include_router(admin_api.router)
 from composio_integration import api as composio_api
 api_router.include_router(composio_api.router)
 
+# Include comprehensive health check endpoints
+api_router.include_router(health_router, prefix="/health")
+
 @api_router.get("/health")
 async def health_check():
     logger.info("Health check endpoint called")
@@ -219,6 +223,163 @@ async def health_check():
     except Exception as e:
         logger.error(f"Failed health docker check: {e}")
         raise HTTPException(status_code=500, detail="Health check failed")
+
+
+@api_router.get("/health/redis")
+async def redis_health():
+    """Redis health check with circuit breaker status."""
+    logger.info("Redis health check endpoint called")
+    try:
+        # Get circuit breaker health
+        circuit_health = await redis.get_circuit_breaker_health()
+        
+        # Test basic Redis connection
+        redis_client = await redis.get_client()
+        await redis_client.ping()
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id,
+            "circuit_breaker": circuit_health
+        }
+    except Exception as e:
+        logger.error(f"Redis health check failed: {e}")
+        try:
+            circuit_health = await redis.get_circuit_breaker_health()
+        except:
+            circuit_health = None
+        
+        return {
+            "status": "unhealthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id,
+            "error": str(e),
+            "circuit_breaker": circuit_health
+        }
+
+
+@api_router.post("/health/redis/reset")
+async def reset_redis_circuit_breaker():
+    """Reset Redis circuit breaker."""
+    logger.info("Redis circuit breaker reset endpoint called")
+    try:
+        await redis.reset_circuit_breaker()
+        return {
+            "status": "success",
+            "message": "Circuit breaker reset successfully",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id
+        }
+    except Exception as e:
+        logger.error(f"Failed to reset Redis circuit breaker: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/health/redis/auto-tune")
+async def auto_tune_redis_circuit_breaker():
+    """Trigger auto-tuning of Redis circuit breaker."""
+    logger.info("Redis circuit breaker auto-tune endpoint called")
+    try:
+        await redis.auto_tune_circuit_breaker()
+        health = await redis.get_circuit_breaker_health()
+        return {
+            "status": "success",
+            "message": "Circuit breaker auto-tuning completed",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id,
+            "health": health
+        }
+    except Exception as e:
+        logger.error(f"Failed to auto-tune Redis circuit breaker: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/health/llm")
+async def llm_health():
+    """LLM service health check with retry manager metrics."""
+    logger.info("LLM health check endpoint called")
+    try:
+        from services.llm_retry_manager import get_retry_manager
+        
+        # Get retry manager metrics
+        retry_manager = get_retry_manager()
+        metrics = await retry_manager.get_metrics()
+        
+        # Test a simple LLM call
+        from services.llm import make_llm_api_call
+        test_response = await make_llm_api_call(
+            messages=[{"role": "user", "content": "Hello"}],
+            model_name="openai/gpt-3.5-turbo",
+            max_tokens=5,
+            use_smart_retry=False  # Don't use retry for health check
+        )
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id,
+            "test_call": "success",
+            "retry_manager": metrics
+        }
+    except Exception as e:
+        logger.error(f"LLM health check failed: {e}")
+        try:
+            from services.llm_retry_manager import get_retry_manager
+            retry_manager = get_retry_manager()
+            metrics = await retry_manager.get_metrics()
+        except:
+            metrics = None
+        
+        return {
+            "status": "unhealthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id,
+            "error": str(e),
+            "retry_manager": metrics
+        }
+
+
+@api_router.post("/health/llm/reset")
+async def reset_llm_retry_manager():
+    """Reset LLM retry manager metrics."""
+    logger.info("LLM retry manager reset endpoint called")
+    try:
+        from services.llm_retry_manager import get_retry_manager
+        
+        retry_manager = get_retry_manager()
+        await retry_manager.reset_metrics()
+        
+        return {
+            "status": "success",
+            "message": "LLM retry manager metrics reset successfully",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id
+        }
+    except Exception as e:
+        logger.error(f"Failed to reset LLM retry manager: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/health/llm/metrics")
+async def get_llm_metrics():
+    """Get detailed LLM retry manager metrics."""
+    logger.info("LLM metrics endpoint called")
+    try:
+        from services.llm_retry_manager import get_retry_manager
+        
+        retry_manager = get_retry_manager()
+        metrics = await retry_manager.get_metrics()
+        
+        return {
+            "status": "success",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id,
+            "metrics": metrics
+        }
+    except Exception as e:
+        logger.error(f"Failed to get LLM metrics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 app.include_router(api_router, prefix="/api")

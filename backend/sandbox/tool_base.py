@@ -1,12 +1,16 @@
 from typing import Optional
 import uuid
+import asyncio
+import time
 
 from agentpress.thread_manager import ThreadManager
 from agentpress.tool import Tool
 from daytona_sdk import AsyncSandbox
 from sandbox.sandbox import get_or_start_sandbox, create_sandbox, delete_sandbox
+from sandbox.daytona_health import daytona_pre_flight_check, get_daytona_health_checker
 from utils.logger import logger
 from utils.files_utils import clean_path
+from utils.error_handler import SandboxError, TransientError
 
 class SandboxToolsBase(Tool):
     """Base class for all sandbox tools that provides project-based sandbox access."""
@@ -30,6 +34,12 @@ class SandboxToolsBase(Tool):
         the metadata to the `projects` table so subsequent calls can reuse it.
         """
         if self._sandbox is None:
+            # Pre-flight check for Daytona service
+            is_healthy, error_msg = await daytona_pre_flight_check()
+            if not is_healthy:
+                logger.error(f"Daytona service is not healthy: {error_msg}")
+                raise SandboxError(f"Cannot create sandbox: {error_msg}")
+            
             try:
                 # Get database client
                 client = await self.thread_manager.db.client
@@ -46,8 +56,39 @@ class SandboxToolsBase(Tool):
                 if not sandbox_info.get('id'):
                     logger.info(f"No sandbox recorded for project {self.project_id}; creating lazily")
                     sandbox_pass = str(uuid.uuid4())
-                    sandbox_obj = await create_sandbox(sandbox_pass, self.project_id)
-                    sandbox_id = sandbox_obj.id
+                    
+                    # Retry sandbox creation with exponential backoff
+                    max_retries = 3
+                    retry_delay = 2.0
+                    sandbox_obj = None
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            logger.info(f"Creating sandbox (attempt {attempt + 1}/{max_retries})")
+                            sandbox_obj = await asyncio.wait_for(
+                                create_sandbox(sandbox_pass, self.project_id),
+                                timeout=15.0  # 15 second timeout for creation
+                            )
+                            sandbox_id = sandbox_obj.id
+                            logger.info(f"Successfully created sandbox {sandbox_id}")
+                            break
+                        except asyncio.TimeoutError:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Sandbox creation timed out, retrying in {retry_delay}s...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2  # Exponential backoff
+                            else:
+                                raise TransientError("Sandbox creation timed out after multiple attempts")
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Sandbox creation failed: {e}, retrying in {retry_delay}s...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
+                            else:
+                                raise
+                    
+                    if not sandbox_obj:
+                        raise SandboxError("Failed to create sandbox after all retries")
 
                     # Gather preview links and token (best-effort parsing)
                     try:
@@ -90,10 +131,43 @@ class SandboxToolsBase(Tool):
                     # Use existing sandbox metadata
                     self._sandbox_id = sandbox_info['id']
                     self._sandbox_pass = sandbox_info.get('pass')
-                    self._sandbox = await get_or_start_sandbox(self._sandbox_id)
+                    
+                    # Retry getting existing sandbox with timeout
+                    max_retries = 3
+                    retry_delay = 1.0
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            logger.info(f"Getting sandbox {self._sandbox_id} (attempt {attempt + 1}/{max_retries})")
+                            self._sandbox = await asyncio.wait_for(
+                                get_or_start_sandbox(self._sandbox_id),
+                                timeout=10.0  # 10 second timeout for getting existing sandbox
+                            )
+                            logger.info(f"Successfully connected to sandbox {self._sandbox_id}")
+                            break
+                        except asyncio.TimeoutError:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Getting sandbox timed out, retrying in {retry_delay}s...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
+                            else:
+                                raise TransientError(f"Failed to connect to sandbox {self._sandbox_id} after multiple attempts")
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Failed to get sandbox: {e}, retrying in {retry_delay}s...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
+                            else:
+                                raise
 
             except Exception as e:
-                logger.error(f"Error retrieving/creating sandbox for project {self.project_id}: {str(e)}", exc_info=True)
+                error_msg = str(e)
+                logger.error(f"Error retrieving/creating sandbox for project {self.project_id}: {error_msg}", exc_info=True)
+                
+                # If sandbox service is unavailable, return None to allow tools to handle it
+                if "timed out" in error_msg.lower() or "daytona" in error_msg.lower():
+                    logger.warning(f"Sandbox service appears to be unavailable - tools may have limited functionality")
+                    return None
                 raise e
 
         return self._sandbox

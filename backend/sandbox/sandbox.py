@@ -3,6 +3,8 @@ from dotenv import load_dotenv
 from utils.logger import logger
 from utils.config import config
 from utils.config import Configuration
+from sandbox.daytona_circuit_breaker import with_circuit_breaker, get_daytona_circuit_breaker
+import asyncio
 
 load_dotenv()
 
@@ -30,19 +32,21 @@ else:
 
 daytona = AsyncDaytona(daytona_config)
 
+@with_circuit_breaker("get_or_start_sandbox", timeout=15.0)
 async def get_or_start_sandbox(sandbox_id: str) -> AsyncSandbox:
     """Retrieve a sandbox by ID, check its state, and start it if needed."""
     
     logger.info(f"Getting or starting sandbox with ID: {sandbox_id}")
 
     try:
-        sandbox = await daytona.get(sandbox_id)
+        # Add timeout to prevent hanging
+        sandbox = await asyncio.wait_for(daytona.get(sandbox_id), timeout=10.0)
         
         # Check if sandbox needs to be started
         if sandbox.state == SandboxState.ARCHIVED or sandbox.state == SandboxState.STOPPED:
             logger.info(f"Sandbox is in {sandbox.state} state. Starting...")
             try:
-                await daytona.start(sandbox)
+                await asyncio.wait_for(daytona.start(sandbox), timeout=30.0)
                 # Wait a moment for the sandbox to initialize
                 # sleep(5)
                 # Refresh sandbox state after starting
@@ -57,6 +61,9 @@ async def get_or_start_sandbox(sandbox_id: str) -> AsyncSandbox:
         logger.info(f"Sandbox {sandbox_id} is ready")
         return sandbox
         
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout accessing sandbox {sandbox_id} - Daytona service may be unavailable")
+        raise Exception(f"Cannot connect to sandbox service - operation timed out")
     except Exception as e:
         logger.error(f"Error retrieving or starting sandbox: {str(e)}")
         raise e
@@ -78,6 +85,7 @@ async def start_supervisord_session(sandbox: AsyncSandbox):
         logger.error(f"Error starting supervisord session: {str(e)}")
         raise e
 
+@with_circuit_breaker("create_sandbox", timeout=30.0)
 async def create_sandbox(password: str, project_id: str = None) -> AsyncSandbox:
     """Create a new sandbox with all required services configured and running."""
     
@@ -107,17 +115,21 @@ async def create_sandbox(password: str, project_id: str = None) -> AsyncSandbox:
             "CHROME_CDP": ""
         },
         resources=Resources(
-            cpu=2,
-            memory=4,
-            disk=5,
+            cpu=4,
+            memory=8,
+            disk=10,
         ),
         auto_stop_interval=15,
         auto_archive_interval=2 * 60,
     )
     
-    # Create the sandbox
-    sandbox = await daytona.create(params)
-    logger.debug(f"Sandbox created with ID: {sandbox.id}")
+    # Create the sandbox with timeout to prevent hanging
+    try:
+        sandbox = await asyncio.wait_for(daytona.create(params), timeout=60.0)
+        logger.debug(f"Sandbox created with ID: {sandbox.id}")
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout creating sandbox after 60 seconds")
+        raise Exception("Sandbox creation timed out - Daytona service may be unavailable")
     
     # Start supervisord in a session for new sandbox
     await start_supervisord_session(sandbox)

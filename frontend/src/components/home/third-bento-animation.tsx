@@ -138,8 +138,7 @@ export function AITaskExecution({
       </div>
 
       {/* Task List */}
-      <AnimatePresence mode="wait">
-        {taskConfigs.map((task, index) => (
+      {taskConfigs.map((task, index) => (
           <motion.div
             key={index}
             initial={{ opacity: 0, x: -20 }}
@@ -186,7 +185,6 @@ export function AITaskExecution({
             </div>
           </motion.div>
         ))}
-      </AnimatePresence>
     </div>
   );
 }

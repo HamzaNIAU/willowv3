@@ -2,8 +2,8 @@
 import { HeroVideoSection } from '@/components/home/sections/hero-video-section';
 import { siteConfig } from '@/lib/home';
 import { ArrowRight, Github, X, AlertCircle, Square } from 'lucide-react';
-import { FlickeringGrid } from '@/components/home/ui/flickering-grid';
 import { useMediaQuery } from '@/hooks/use-media-query';
+import dynamic from 'next/dynamic';
 import { useState, useEffect, useRef, FormEvent } from 'react';
 import { useScroll } from 'motion/react';
 import Link from 'next/link';
@@ -48,6 +48,17 @@ const BlurredDialogOverlay = () => (
 
 // Constant for localStorage key to ensure consistency
 const PENDING_PROMPT_KEY = 'pendingAgentPrompt';
+
+// Dynamic import of GradientBackground to avoid SSR issues with Three.js
+const GradientBackground = dynamic(
+  () => import('@/components/home/ui/gradient-background').then(mod => ({ default: mod.GradientBackground })),
+  { 
+    ssr: false,
+    loading: () => (
+      <div className="absolute inset-0 -z-20 bg-gradient-to-b from-purple-900/20 via-blue-900/20 to-orange-900/20" />
+    )
+  }
+);
 
 
 
@@ -233,55 +244,22 @@ export function HeroSection() {
 
   return (
     <section id="hero" className="w-full relative overflow-hidden">
+      {/* Custom Grainy Gradient Background - positioned to fill entire section */}
+      <GradientBackground />
+      
       <div className="relative flex flex-col items-center w-full px-4 sm:px-6">
-        {/* Left side flickering grid with gradient fades */}
-        <div className="hidden sm:block absolute left-0 top-0 h-[500px] sm:h-[600px] md:h-[800px] w-1/4 sm:w-1/3 -z-10 overflow-hidden">
-          {/* Horizontal fade from left to right */}
-          <div className="absolute inset-0 bg-gradient-to-r from-transparent via-transparent to-background z-10" />
-
-          {/* Vertical fade from top */}
-          <div className="absolute inset-x-0 top-0 h-32 bg-gradient-to-b from-background via-background/90 to-transparent z-10" />
-
-          {/* Vertical fade to bottom */}
-          <div className="absolute inset-x-0 bottom-0 h-48 bg-gradient-to-t from-background via-background/90 to-transparent z-10" />
-
-          {mounted && (
-            <FlickeringGrid
-              className="h-full w-full"
-              squareSize={tablet ? 2 : 2.5}
-              gridGap={tablet ? 2 : 2.5}
-              color="var(--secondary)"
-              maxOpacity={tablet ? 0.2 : 0.4}
-              flickerChance={isScrolling ? 0.005 : (tablet ? 0.015 : 0.03)} // Lower performance impact on mobile
-            />
-          )}
+        {/* Gradient overlays for better text readability */}
+        <div className="absolute inset-0 -z-10">
+          {/* Top fade - much lighter to let gradient show through */}
+          <div className="absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-background/20 to-transparent" />
+          
+          {/* Bottom fade - positioned much lower to align with gradient transition */}
+          <div className="absolute inset-x-0 bottom-0 h-80 bg-gradient-to-t from-background via-background/95 to-transparent translate-y-32" />
+          
+          {/* Very subtle center overlay for text contrast */}
+          <div className="absolute inset-0 bg-background/10" />
         </div>
 
-        {/* Right side flickering grid with gradient fades */}
-        <div className="hidden sm:block absolute right-0 top-0 h-[500px] sm:h-[600px] md:h-[800px] w-1/4 sm:w-1/3 -z-10 overflow-hidden">
-          {/* Horizontal fade from right to left */}
-          <div className="absolute inset-0 bg-gradient-to-l from-transparent via-transparent to-background z-10" />
-
-          {/* Vertical fade from top */}
-          <div className="absolute inset-x-0 top-0 h-32 bg-gradient-to-b from-background via-background/90 to-transparent z-10" />
-
-          {/* Vertical fade to bottom */}
-          <div className="absolute inset-x-0 bottom-0 h-48 bg-gradient-to-t from-background via-background/90 to-transparent z-10" />
-
-          {mounted && (
-            <FlickeringGrid
-              className="h-full w-full"
-              squareSize={tablet ? 2 : 2.5}
-              gridGap={tablet ? 2 : 2.5}
-              color="var(--secondary)"
-              maxOpacity={tablet ? 0.2 : 0.4}
-              flickerChance={isScrolling ? 0.005 : (tablet ? 0.015 : 0.03)} // Lower performance impact on mobile
-            />
-          )}
-        </div>
-
-        {/* Center content background with rounded bottom */}
-        <div className="absolute inset-x-0 sm:inset-x-1/6 md:inset-x-1/4 top-0 h-[500px] sm:h-[600px] md:h-[800px] -z-20 bg-background rounded-b-xl"></div>
 
         <div className="relative z-10 pt-16 sm:pt-24 md:pt-32 mx-auto h-full w-full max-w-6xl flex flex-col items-center justify-center">
           {/* <p className="border border-border bg-accent rounded-full text-sm h-8 px-3 flex items-center gap-2">

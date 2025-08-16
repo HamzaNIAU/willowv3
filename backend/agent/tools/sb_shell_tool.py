@@ -6,6 +6,7 @@ from uuid import uuid4
 from agentpress.tool import ToolResult, openapi_schema, usage_example
 from sandbox.tool_base import SandboxToolsBase
 from agentpress.thread_manager import ThreadManager
+from utils.logger import logger
 
 class SandboxShellTool(SandboxToolsBase):
     """Tool for executing tasks in a Daytona sandbox with browser-use capabilities. 
@@ -21,11 +22,17 @@ class SandboxShellTool(SandboxToolsBase):
         if session_name not in self._sessions:
             session_id = str(uuid4())
             try:
+                logger.info(f"Creating new session '{session_name}' with ID: {session_id}")
                 await self._ensure_sandbox()  # Ensure sandbox is initialized
+                logger.debug(f"Sandbox ensured, creating process session for {session_id}")
                 await self.sandbox.process.create_session(session_id)
                 self._sessions[session_name] = session_id
+                logger.info(f"Session '{session_name}' created successfully")
             except Exception as e:
+                logger.error(f"Failed to create session '{session_name}': {str(e)}")
                 raise RuntimeError(f"Failed to create session: {str(e)}")
+        else:
+            logger.debug(f"Using existing session '{session_name}': {self._sessions[session_name]}")
         return self._sessions[session_name]
 
     async def _cleanup_session(self, session_name: str):
@@ -107,8 +114,10 @@ class SandboxShellTool(SandboxToolsBase):
         blocking: bool = False,
         timeout: int = 60
     ) -> ToolResult:
+        logger.info(f"Executing command: {command[:100]}... (blocking={blocking}, timeout={timeout}s)")
         try:
             # Ensure sandbox is initialized
+            logger.debug("Ensuring sandbox is initialized for command execution")
             await self._ensure_sandbox()
             
             # Set up working directory

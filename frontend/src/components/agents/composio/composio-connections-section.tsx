@@ -493,6 +493,10 @@ export const ComposioConnectionsSection: React.FC<ComposioConnectionsSectionProp
   const [searchQuery, setSearchQuery] = useState('');
   const [showRegistry, setShowRegistry] = useState(false);
   const queryClient = useQueryClient();
+  
+  // Debug logging
+  console.log('ComposioConnectionsSection - showRegistry:', showRegistry);
+  console.log('ComposioConnectionsSection - toolkits:', toolkits);
 
   const filteredToolkits = useMemo(() => {
     if (!toolkits || !searchQuery.trim()) return toolkits || [];
@@ -575,23 +579,44 @@ export const ComposioConnectionsSection: React.FC<ComposioConnectionsSectionProp
 
   if (!toolkits || toolkits.length === 0) {
     return (
-      <div className={cn("space-y-6", className)}>
-        <Card className="border-dashed">
-          <CardContent className="py-12">
-            <div className="text-center">
-              <Settings className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-              <h3 className="text-lg font-medium mb-2">No Connections</h3>
-              <p className="text-muted-foreground mb-4">
-                You haven't connected any applications yet.
-              </p>
-              <Button variant="outline" onClick={() => setShowRegistry(true)}>
-                <Plus className="h-4 w-4" />
-                Connect Apps
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+      <>
+        <div className={cn("space-y-6", className)}>
+          <Card className="border-dashed">
+            <CardContent className="py-12">
+              <div className="text-center">
+                <Settings className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
+                <h3 className="text-lg font-medium mb-2">No Connections</h3>
+                <p className="text-muted-foreground mb-4">
+                  You haven't connected any applications yet.
+                </p>
+                <Button 
+                  variant="outline" 
+                  onClick={() => {
+                    console.log('Connect Apps button clicked!');
+                    setShowRegistry(true);
+                  }}
+                >
+                  <Plus className="h-4 w-4" />
+                  Connect Apps
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+        
+        <Dialog open={showRegistry} onOpenChange={setShowRegistry}>
+          <DialogContent className="p-0 max-w-6xl h-[90vh] overflow-hidden">
+            <DialogHeader className="sr-only">
+              <DialogTitle>Connect New App</DialogTitle>
+            </DialogHeader>
+            <ComposioRegistry
+              mode="profile-only"
+              onClose={() => setShowRegistry(false)}
+              onToolsSelected={handleProfileCreated}
+            />
+          </DialogContent>
+        </Dialog>
+      </>
     );
   }
 

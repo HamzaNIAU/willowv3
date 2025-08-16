@@ -92,7 +92,7 @@ export function FirstBentoAnimation() {
           </div>
 
           <div className="relative">
-            <AnimatePresence mode="wait">
+            <AnimatePresence>
               {!shouldAnimate ? (
                 <motion.div
                   key="dots"

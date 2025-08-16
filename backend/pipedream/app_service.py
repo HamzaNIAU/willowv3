@@ -250,7 +250,7 @@ class AppService:
 
     async def _get_popular(self, category: Optional[str] = None, limit: int = 100) -> List[App]:
         popular_slugs = [
-            "slack", "microsoft_teams", "discord", "zoom", "telegram_bot_api",
+            "microsoft_teams", "zoom",
             "gmail", "microsoft_outlook", "google_calendar", "microsoft_exchange", "calendly",
             "google_drive", "microsoft_onedrive", "dropbox", "google_docs", "google_sheets",
             "notion", "asana", "monday", "trello", "linear", "jira", "clickup",
@@ -258,7 +258,7 @@ class AppService:
             "github", "gitlab", "bitbucket", "docker", "jenkins", "vercel", "netlify",
             "supabase", "firebase", "mongodb", "postgresql", "mysql", "redis", "airtable",
             "openai", "anthropic", "hugging_face", "replicate",
-            "google_analytics", "facebook", "instagram", "twitter", "linkedin", "mailchimp",
+            "google_analytics",
             "stripe", "paypal", "quickbooks", "xero", "square",
             "aws", "google_cloud", "microsoft_azure", "digitalocean", "heroku",
             "shopify", "woocommerce", "magento", "bigcommerce"

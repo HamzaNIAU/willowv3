@@ -33,6 +33,8 @@ from agent.tools.mcp_tool_wrapper import MCPToolWrapper
 from agent.tools.task_list_tool import TaskListTool
 from agentpress.tool import SchemaType
 from agent.tools.sb_sheets_tool import SandboxSheetsTool
+from utils.status_tracker import StatusTracker, AgentRunStatus
+from utils.error_handler import ErrorHandler, KortixError
 
 load_dotenv()
 
@@ -52,6 +54,7 @@ class AgentConfig:
     trace: Optional[StatefulTraceClient] = None
     is_agent_builder: Optional[bool] = False
     target_agent_id: Optional[str] = None
+    status_tracker: Optional[StatusTracker] = None
 
 
 class ToolManager:
@@ -462,15 +465,42 @@ class AgentRunner:
         return None
     
     async def run(self) -> AsyncGenerator[Dict[str, Any], None]:
+        logger.info(f"[AGENT RUN] Starting agent run for thread {self.config.thread_id}")
+        
+        # Update status if tracker provided
+        if self.config.status_tracker:
+            await self.config.status_tracker.update_status(
+                AgentRunStatus.LOADING_AGENT,
+                "Loading agent configuration"
+            )
+        
         await self.setup()
+        logger.info(f"[AGENT RUN] Setup completed")
+        
+        if self.config.status_tracker:
+            await self.config.status_tracker.update_status(
+                AgentRunStatus.LOADING_TOOLS,
+                "Registering agent tools"
+            )
+        
         await self.setup_tools()
+        logger.info(f"[AGENT RUN] Tools setup completed")
+        
+        if self.config.status_tracker:
+            await self.config.status_tracker.update_status(
+                AgentRunStatus.LOADING_MCP,
+                "Initializing MCP servers"
+            )
+        
         mcp_wrapper_instance = await self.setup_mcp_tools()
+        logger.info(f"[AGENT RUN] MCP tools setup completed, instance: {mcp_wrapper_instance is not None}")
         
         system_message = await PromptManager.build_system_prompt(
             self.config.model_name, self.config.agent_config, 
             self.config.is_agent_builder, self.config.thread_id, 
             mcp_wrapper_instance
         )
+        logger.info(f"[AGENT RUN] System prompt built")
 
         iteration_count = 0
         continue_execution = True
@@ -485,10 +515,23 @@ class AgentRunner:
 
         message_manager = MessageManager(self.client, self.config.thread_id, self.config.model_name, self.config.trace)
 
+        logger.info(f"[AGENT RUN] Starting execution loop")
+        
+        if self.config.status_tracker:
+            await self.config.status_tracker.update_status(
+                AgentRunStatus.EXECUTING,
+                "Starting agent execution loop"
+            )
+        
         while continue_execution and iteration_count < self.config.max_iterations:
             iteration_count += 1
+            logger.info(f"[AGENT RUN] Iteration {iteration_count}")
+            
+            if self.config.status_tracker:
+                await self.config.status_tracker.increment_iteration()
 
             can_run, message, subscription = await check_billing_status(self.client, self.account_id)
+            logger.info(f"[AGENT RUN] Billing check: can_run={can_run}")
             if not can_run:
                 error_msg = f"Billing limit reached: {message}"
                 yield {
@@ -509,6 +552,15 @@ class AgentRunner:
             max_tokens = self.get_max_tokens()
             
             generation = self.config.trace.generation(name="thread_manager.run_thread") if self.config.trace else None
+            logger.info(f"[AGENT RUN] About to call thread_manager.run_thread")
+            
+            # Update status before calling LLM
+            if self.config.status_tracker:
+                await self.config.status_tracker.update_status(
+                    AgentRunStatus.CALLING_LLM,
+                    f"Calling {self.config.model_name.split('/')[-1]}"
+                )
+            
             try:
                 response = await self.thread_manager.run_thread(
                     thread_id=self.config.thread_id,
@@ -537,8 +589,21 @@ class AgentRunner:
                 )
 
                 if isinstance(response, dict) and "status" in response and response["status"] == "error":
+                    if self.config.status_tracker:
+                        await self.config.status_tracker.update_status(
+                            AgentRunStatus.FAILED,
+                            "Agent execution failed",
+                            error=response.get("message", "Unknown error")
+                        )
                     yield response
                     break
+
+                # Update status to processing response
+                if self.config.status_tracker:
+                    await self.config.status_tracker.update_status(
+                        AgentRunStatus.PROCESSING_RESPONSE,
+                        "Processing LLM response"
+                    )
 
                 last_tool_call = None
                 agent_should_terminate = False
@@ -568,8 +633,12 @@ class AgentRunner:
                                         
                                         if content.get('function_name'):
                                             last_tool_call = content['function_name']
+                                            if self.config.status_tracker:
+                                                await self.config.status_tracker.start_tool_execution(last_tool_call)
                                         elif content.get('xml_tag_name'):
                                             last_tool_call = content['xml_tag_name']
+                                            if self.config.status_tracker:
+                                                await self.config.status_tracker.start_tool_execution(last_tool_call)
                                             
                                 except Exception:
                                     pass
@@ -607,17 +676,33 @@ class AgentRunner:
                     if error_detected:
                         if generation:
                             generation.end(output=full_response, status_message="error_detected", level="ERROR")
+                        if self.config.status_tracker:
+                            await self.config.status_tracker.update_status(
+                                AgentRunStatus.FAILED,
+                                "Error detected during execution"
+                            )
                         break
                         
                     if agent_should_terminate or last_tool_call in ['ask', 'complete', 'web-browser-takeover']:
                         if generation:
                             generation.end(output=full_response, status_message="agent_stopped")
+                        if self.config.status_tracker:
+                            await self.config.status_tracker.update_status(
+                                AgentRunStatus.COMPLETING,
+                                "Agent terminating normally"
+                            )
                         continue_execution = False
 
                 except Exception as e:
                     error_msg = f"Error during response streaming: {str(e)}"
                     if generation:
                         generation.end(output=full_response, status_message=error_msg, level="ERROR")
+                    if self.config.status_tracker:
+                        await self.config.status_tracker.update_status(
+                            AgentRunStatus.FAILED,
+                            "Error during response streaming",
+                            error=error_msg
+                        )
                     yield {
                         "type": "status",
                         "status": "error",
@@ -627,6 +712,12 @@ class AgentRunner:
                     
             except Exception as e:
                 error_msg = f"Error running thread: {str(e)}"
+                if self.config.status_tracker:
+                    await self.config.status_tracker.update_status(
+                        AgentRunStatus.FAILED,
+                        "Error running thread",
+                        error=error_msg
+                    )
                 yield {
                     "type": "status",
                     "status": "error",
@@ -637,6 +728,14 @@ class AgentRunner:
             if generation:
                 generation.end(output=full_response)
 
+        # Final status update if successful
+        if continue_execution == False and not error_detected:
+            if self.config.status_tracker:
+                await self.config.status_tracker.update_status(
+                    AgentRunStatus.COMPLETED,
+                    "Agent run completed successfully"
+                )
+        
         asyncio.create_task(asyncio.to_thread(lambda: langfuse.flush()))
 
 
@@ -654,7 +753,8 @@ async def run_agent(
     agent_config: Optional[dict] = None,    
     trace: Optional[StatefulTraceClient] = None,
     is_agent_builder: Optional[bool] = False,
-    target_agent_id: Optional[str] = None
+    target_agent_id: Optional[str] = None,
+    status_tracker: Optional[StatusTracker] = None
 ):
     effective_model = model_name
     if model_name == "anthropic/claude-sonnet-4-20250514" and agent_config and agent_config.get('model'):
@@ -678,7 +778,8 @@ async def run_agent(
         agent_config=agent_config,
         trace=trace,
         is_agent_builder=is_agent_builder,
-        target_agent_id=target_agent_id
+        target_agent_id=target_agent_id,
+        status_tracker=status_tracker
     )
     
     runner = AgentRunner(config)

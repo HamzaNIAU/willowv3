@@ -5,6 +5,10 @@ import asyncio
 from utils.logger import logger
 from typing import List, Any
 from utils.retry import retry
+from services.redis_circuit_breaker import (
+    get_circuit_breaker, initialize_circuit_breaker, execute_with_circuit_breaker,
+    OperationType, CircuitConfig
+)
 
 # Redis client and connection pool
 client: redis.Redis | None = None
@@ -64,11 +68,25 @@ async def initialize_async():
         if not _initialized:
             logger.info("Initializing Redis connection")
             initialize()
+            
+            # Initialize circuit breaker
+            circuit_config = CircuitConfig(
+                read_failure_threshold=int(os.getenv("REDIS_READ_FAILURE_THRESHOLD", "5")),
+                write_failure_threshold=int(os.getenv("REDIS_WRITE_FAILURE_THRESHOLD", "3")),
+                pubsub_failure_threshold=int(os.getenv("REDIS_PUBSUB_FAILURE_THRESHOLD", "2")),
+                recovery_timeout=float(os.getenv("REDIS_RECOVERY_TIMEOUT", "30.0")),
+                fallback_cache_size=int(os.getenv("REDIS_FALLBACK_CACHE_SIZE", "1000")),
+                auto_tune_enabled=os.getenv("REDIS_AUTO_TUNE", "true").lower() == "true"
+            )
+            initialize_circuit_breaker(circuit_config)
 
         try:
-            # Test connection with timeout
-            await asyncio.wait_for(client.ping(), timeout=5.0)
-            logger.info("Successfully connected to Redis")
+            # Test connection with timeout via circuit breaker
+            await execute_with_circuit_breaker(
+                lambda: asyncio.wait_for(client.ping(), timeout=5.0),
+                OperationType.READ
+            )
+            logger.info("Successfully connected to Redis with circuit breaker")
             _initialized = True
         except asyncio.TimeoutError:
             logger.error("Redis connection timeout during initialization")
@@ -123,28 +141,47 @@ async def get_client():
 
 # Basic Redis operations
 async def set(key: str, value: str, ex: int = None, nx: bool = False):
-    """Set a Redis key."""
+    """Set a Redis key with circuit breaker protection."""
     redis_client = await get_client()
-    return await redis_client.set(key, value, ex=ex, nx=nx)
+    return await execute_with_circuit_breaker(
+        lambda: redis_client.set(key, value, ex=ex, nx=nx),
+        OperationType.WRITE
+    )
 
 
 async def get(key: str, default: str = None):
-    """Get a Redis key."""
+    """Get a Redis key with circuit breaker protection and fallback caching."""
     redis_client = await get_client()
-    result = await redis_client.get(key)
-    return result if result is not None else default
+    
+    try:
+        result = await execute_with_circuit_breaker(
+            lambda: redis_client.get(key),
+            OperationType.READ,
+            cache_key=f"get:{key}",
+            cache_ttl=300
+        )
+        return result if result is not None else default
+    except Exception as e:
+        logger.warning(f"Redis GET failed for key {key}: {e}")
+        return default
 
 
 async def delete(key: str):
-    """Delete a Redis key."""
+    """Delete a Redis key with circuit breaker protection."""
     redis_client = await get_client()
-    return await redis_client.delete(key)
+    return await execute_with_circuit_breaker(
+        lambda: redis_client.delete(key),
+        OperationType.WRITE
+    )
 
 
 async def publish(channel: str, message: str):
-    """Publish a message to a Redis channel."""
+    """Publish a message to a Redis channel with circuit breaker protection."""
     redis_client = await get_client()
-    return await redis_client.publish(channel, message)
+    return await execute_with_circuit_breaker(
+        lambda: redis_client.publish(channel, message),
+        OperationType.PUBSUB
+    )
 
 
 async def create_pubsub():
@@ -155,25 +192,62 @@ async def create_pubsub():
 
 # List operations
 async def rpush(key: str, *values: Any):
-    """Append one or more values to a list."""
+    """Append one or more values to a list with circuit breaker protection."""
     redis_client = await get_client()
-    return await redis_client.rpush(key, *values)
+    return await execute_with_circuit_breaker(
+        lambda: redis_client.rpush(key, *values),
+        OperationType.WRITE
+    )
 
 
 async def lrange(key: str, start: int, end: int) -> List[str]:
-    """Get a range of elements from a list."""
+    """Get a range of elements from a list with circuit breaker protection."""
     redis_client = await get_client()
-    return await redis_client.lrange(key, start, end)
+    return await execute_with_circuit_breaker(
+        lambda: redis_client.lrange(key, start, end),
+        OperationType.READ,
+        cache_key=f"lrange:{key}:{start}:{end}",
+        cache_ttl=60  # Shorter TTL for lists as they change more frequently
+    )
 
 
 # Key management
-
-
 async def keys(pattern: str) -> List[str]:
+    """Get keys matching pattern with circuit breaker protection."""
     redis_client = await get_client()
-    return await redis_client.keys(pattern)
+    return await execute_with_circuit_breaker(
+        lambda: redis_client.keys(pattern),
+        OperationType.READ,
+        cache_key=f"keys:{pattern}",
+        cache_ttl=30  # Short TTL for key listings
+    )
 
 
 async def expire(key: str, seconds: int):
+    """Set expiration on a key with circuit breaker protection."""
     redis_client = await get_client()
-    return await redis_client.expire(key, seconds)
+    return await execute_with_circuit_breaker(
+        lambda: redis_client.expire(key, seconds),
+        OperationType.WRITE
+    )
+
+
+# Circuit breaker health and monitoring
+async def get_circuit_breaker_health():
+    """Get circuit breaker health status."""
+    circuit_breaker = get_circuit_breaker()
+    return await circuit_breaker.get_health_status()
+
+
+async def reset_circuit_breaker():
+    """Reset circuit breaker to initial state."""
+    circuit_breaker = get_circuit_breaker()
+    await circuit_breaker.reset()
+    logger.info("Redis circuit breaker reset")
+
+
+async def auto_tune_circuit_breaker():
+    """Trigger auto-tuning of circuit breaker thresholds."""
+    circuit_breaker = get_circuit_breaker()
+    await circuit_breaker.auto_tune_thresholds()
+    logger.info("Redis circuit breaker auto-tuning completed")

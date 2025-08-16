@@ -2,11 +2,9 @@ import json
 from typing import Union, Dict, Any
 
 from agentpress.tool import Tool, ToolResult, openapi_schema, usage_example
-from agent.tools.data_providers.LinkedinProvider import LinkedinProvider
 from agent.tools.data_providers.YahooFinanceProvider import YahooFinanceProvider
 from agent.tools.data_providers.AmazonProvider import AmazonProvider
 from agent.tools.data_providers.ZillowProvider import ZillowProvider
-from agent.tools.data_providers.TwitterProvider import TwitterProvider
 
 class DataProvidersTool(Tool):
     """Tool for making requests to various data providers."""
@@ -15,11 +13,9 @@ class DataProvidersTool(Tool):
         super().__init__()
 
         self.register_data_providers = {
-            "linkedin": LinkedinProvider(),
             "yahoo_finance": YahooFinanceProvider(),
             "amazon": AmazonProvider(),
-            "zillow": ZillowProvider(),
-            "twitter": TwitterProvider()
+            "zillow": ZillowProvider()
         }
 
     @openapi_schema({
@@ -32,7 +28,7 @@ class DataProvidersTool(Tool):
                 "properties": {
                     "service_name": {
                         "type": "string",
-                        "description": "The name of the data provider (e.g., 'linkedin', 'twitter', 'zillow', 'amazon', 'yahoo_finance')"
+                        "description": "The name of the data provider (e.g., 'zillow', 'amazon', 'yahoo_finance')"
                     }
                 },
                 "required": ["service_name"]
@@ -45,10 +41,10 @@ The get-data-provider-endpoints tool returns available endpoints for a specific 
 Use this tool when you need to discover what endpoints are available.
 -->
 
-<!-- Example to get LinkedIn API endpoints -->
+<!-- Example to get Amazon API endpoints -->
 <function_calls>
 <invoke name="get_data_provider_endpoints">
-<parameter name="service_name">linkedin</parameter>
+<parameter name="service_name">amazon</parameter>
 </invoke>
 </function_calls>
         ''')
@@ -60,7 +56,7 @@ Use this tool when you need to discover what endpoints are available.
         Get available endpoints for a specific data provider.
         
         Parameters:
-        - service_name: The name of the data provider (e.g., 'linkedin')
+        - service_name: The name of the data provider (e.g., 'amazon')
         """
         try:
             if not service_name:
@@ -89,7 +85,7 @@ Use this tool when you need to discover what endpoints are available.
                 "properties": {
                     "service_name": {
                         "type": "string",
-                        "description": "The name of the API service (e.g., 'linkedin')"
+                        "description": "The name of the API service (e.g., 'amazon')"
                     },
                     "route": {
                         "type": "string",

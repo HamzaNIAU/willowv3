@@ -1243,10 +1243,47 @@ class ResponseProcessor:
                 return ToolResult(success=False, output=f"Tool function '{function_name}' not found")
             
             logger.debug(f"Found tool function for '{function_name}', executing...")
-            result = await tool_fn(**arguments)
-            logger.info(f"Tool execution complete: {function_name} -> {result}")
-            span.end(status_message="tool_executed", output=result)
-            return result
+            
+            # Get timeout from tool call or use default
+            timeout = tool_call.get("timeout", 120)  # Default 120 seconds
+            
+            # Execute with timeout if specified
+            if timeout and timeout > 0:
+                try:
+                    logger.debug(f"Executing tool {function_name} with {timeout}s timeout")
+                    result = await asyncio.wait_for(
+                        tool_fn(**arguments),
+                        timeout=timeout
+                    )
+                    logger.info(f"Tool execution complete: {function_name} -> {result}")
+                    span.end(status_message="tool_executed", output=result)
+                    return result
+                except asyncio.TimeoutError:
+                    logger.warning(f"Tool {function_name} timed out after {timeout} seconds")
+                    # Import error handler if available
+                    try:
+                        from utils.error_handler import TimeoutError as KortixTimeoutError
+                        # Log timeout error for monitoring
+                        timeout_error = KortixTimeoutError(
+                            operation=f"Tool execution: {function_name}",
+                            timeout_seconds=timeout
+                        )
+                        logger.error(f"Tool timeout: {timeout_error.context.to_dict()}")
+                    except ImportError:
+                        pass
+                    
+                    span.end(status_message=f"Tool timed out after {timeout}s", level="ERROR")
+                    return ToolResult(
+                        success=False,
+                        output=f"Tool execution timed out after {timeout} seconds. The operation is taking longer than expected.",
+                        metadata={"timeout": True, "timeout_seconds": timeout}
+                    )
+            else:
+                # No timeout, execute normally
+                result = await tool_fn(**arguments)
+                logger.info(f"Tool execution complete: {function_name} -> {result}")
+                span.end(status_message="tool_executed", output=result)
+                return result
         except Exception as e:
             logger.error(f"Error executing tool {tool_call['function_name']}: {str(e)}", exc_info=True)
             span.end(status_message="tool_execution_error", output=f"Error executing tool: {str(e)}", level="ERROR")

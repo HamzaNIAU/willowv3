@@ -23,6 +23,11 @@ from services.llm import make_llm_api_call
 from run_agent_background import run_agent_background, _cleanup_redis_response_list, update_agent_run_status
 from utils.constants import MODEL_NAME_ALIASES
 from flags.flags import is_enabled
+from utils.error_handler import (
+    ErrorHandler, KortixError, SandboxError, BillingError as KortixBillingError,
+    RateLimitError, AgentRunStatus, wrap_with_error_handling
+)
+from utils.status_tracker import StatusTracker, StatusMonitor, ProgressReporter
 
 from .config_helper import extract_agent_config, build_unified_config, extract_tools_for_agent_run, get_mcp_configs
 from .utils import check_agent_run_limit
@@ -540,6 +545,119 @@ async def stop_agent(agent_run_id: str, user_id: str = Depends(get_current_user_
     await get_agent_run_with_access_check(client, agent_run_id, user_id)
     await stop_agent_run(agent_run_id)
     return {"status": "stopped"}
+
+@router.get("/agent-run/{agent_run_id}/status")
+async def get_agent_run_status(agent_run_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
+    """Get detailed status and progress of an agent run."""
+    structlog.contextvars.bind_contextvars(
+        agent_run_id=agent_run_id,
+    )
+    logger.info(f"Fetching detailed status for agent run: {agent_run_id}")
+    
+    try:
+        client = await db.client
+        agent_run_data = await get_agent_run_with_access_check(client, agent_run_id, user_id)
+        
+        # Get status from Redis
+        status_update = await StatusMonitor.get_status(agent_run_id)
+        
+        # Check heartbeat
+        is_alive = await StatusMonitor.check_heartbeat(agent_run_id)
+        
+        response = {
+            "agent_run_id": agent_run_id,
+            "thread_id": agent_run_data['thread_id'],
+            "database_status": agent_run_data['status'],
+            "is_alive": is_alive,
+            "started_at": agent_run_data['started_at'],
+            "completed_at": agent_run_data['completed_at'],
+            "error": agent_run_data['error']
+        }
+        
+        if status_update:
+            response.update({
+                "current_status": status_update.status.value,
+                "progress_percentage": status_update.progress_percentage,
+                "message": status_update.message,
+                "iteration": status_update.iteration,
+                "tools_executed": status_update.tools_executed,
+                "current_tool": status_update.current_tool,
+                "details": status_update.details,
+                "last_update": status_update.updated_at.isoformat()
+            })
+        else:
+            response["current_status"] = "unknown"
+            response["message"] = "No real-time status available"
+        
+        return response
+        
+    except Exception as e:
+        context = ErrorHandler.classify_error(e)
+        ErrorHandler.log_error(context, "get_agent_run_status")
+        raise HTTPException(
+            status_code=500,
+            detail=context.to_dict() if hasattr(context, 'to_dict') else {"message": str(e)}
+        )
+
+@router.post("/agent-run/{agent_run_id}/recover")
+async def recover_agent_run(agent_run_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
+    """Attempt to recover a stuck agent run."""
+    structlog.contextvars.bind_contextvars(
+        agent_run_id=agent_run_id,
+    )
+    logger.info(f"Attempting to recover agent run: {agent_run_id}")
+    
+    try:
+        client = await db.client
+        await get_agent_run_with_access_check(client, agent_run_id, user_id)
+        
+        # Check if the run is actually stuck
+        is_alive = await StatusMonitor.check_heartbeat(agent_run_id)
+        if is_alive:
+            return {"status": "running", "message": "Agent run is still alive"}
+        
+        # Attempt recovery
+        recovered = await StatusMonitor.recover_stuck_run(agent_run_id)
+        if recovered:
+            return {"status": "recovered", "message": "Agent run has been terminated and marked as failed"}
+        else:
+            return {"status": "failed", "message": "Could not recover agent run"}
+            
+    except Exception as e:
+        context = ErrorHandler.classify_error(e)
+        ErrorHandler.log_error(context, "recover_agent_run")
+        raise HTTPException(status_code=500, detail={"message": str(e)})
+
+@router.get("/agent-runs/stuck")
+async def get_stuck_agent_runs(user_id: str = Depends(get_current_user_id_from_jwt)):
+    """Get all stuck agent runs for monitoring."""
+    logger.info("Checking for stuck agent runs")
+    
+    try:
+        # Find stuck runs
+        stuck_runs = await StatusMonitor.find_stuck_runs(max_age_seconds=300)
+        
+        # Filter by user access
+        client = await db.client
+        accessible_runs = []
+        
+        for run_id in stuck_runs:
+            try:
+                agent_run = await client.table('agent_runs').select('*, threads(account_id)').eq('id', run_id).execute()
+                if agent_run.data and agent_run.data[0]['threads']['account_id'] == user_id:
+                    accessible_runs.append(run_id)
+            except:
+                pass
+        
+        return {
+            "stuck_runs": accessible_runs,
+            "count": len(accessible_runs),
+            "checked_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking for stuck runs: {e}")
+        raise HTTPException(status_code=500, detail={"message": str(e)})
 
 @router.get("/thread/{thread_id}/agent-runs")
 async def get_agent_runs(thread_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):

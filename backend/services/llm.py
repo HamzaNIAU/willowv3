@@ -14,11 +14,16 @@ from typing import Union, Dict, Any, Optional, AsyncGenerator, List
 import os
 import json
 import asyncio
+import uuid
 from openai import OpenAIError
 import litellm
 from litellm.files.main import ModelResponse
 from utils.logger import logger
 from utils.config import config
+from services.llm_retry_manager import (
+    get_retry_manager, initialize_retry_manager, execute_with_smart_retry,
+    RequestPriority, RetryConfig
+)
 
 # litellm.set_verbose=True
 # Let LiteLLM auto-adjust params and drop unsupported ones (e.g., GPT-5 temperature!=1)
@@ -290,10 +295,12 @@ async def make_llm_api_call(
     top_p: Optional[float] = None,
     model_id: Optional[str] = None,
     enable_thinking: Optional[bool] = False,
-    reasoning_effort: Optional[str] = 'low'
+    reasoning_effort: Optional[str] = 'low',
+    priority: Optional[RequestPriority] = None,
+    use_smart_retry: bool = True
 ) -> Union[Dict[str, Any], AsyncGenerator, ModelResponse]:
     """
-    Make an API call to a language model using LiteLLM.
+    Make an API call to a language model using LiteLLM with smart retry.
 
     Args:
         messages: List of message dictionaries for the conversation
@@ -310,6 +317,8 @@ async def make_llm_api_call(
         model_id: Optional ARN for Bedrock inference profiles
         enable_thinking: Whether to enable thinking
         reasoning_effort: Level of reasoning effort
+        priority: Request priority level
+        use_smart_retry: Whether to use smart retry with model fallback
 
     Returns:
         Union[Dict[str, Any], AsyncGenerator]: API response or stream
@@ -318,49 +327,114 @@ async def make_llm_api_call(
         LLMRetryError: If API call fails after retries
         LLMError: For other API-related errors
     """
-    # debug <timestamp>.json messages
-    logger.info(f"Making LLM API call to model: {model_name} (Thinking: {enable_thinking}, Effort: {reasoning_effort})")
-    logger.info(f"📡 API Call: Using model {model_name}")
-    params = prepare_params(
-        messages=messages,
-        model_name=model_name,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        response_format=response_format,
-        tools=tools,
-        tool_choice=tool_choice,
-        api_key=api_key,
-        api_base=api_base,
-        stream=stream,
-        top_p=top_p,
-        model_id=model_id,
-        enable_thinking=enable_thinking,
-        reasoning_effort=reasoning_effort
+    # Generate unique request ID
+    request_id = str(uuid.uuid4())
+    
+    logger.info(
+        f"Making LLM API call to model: {model_name} "
+        f"(Thinking: {enable_thinking}, Effort: {reasoning_effort}, "
+        f"Priority: {priority}, Smart Retry: {use_smart_retry})"
     )
-    last_error = None
-    for attempt in range(MAX_RETRIES):
+    logger.info(f"📡 API Call: Using model {model_name} (Request ID: {request_id})")
+    
+    # Determine capabilities required based on request
+    capabilities_required = []
+    if enable_thinking:
+        capabilities_required.append("thinking")
+    if tools:
+        capabilities_required.append("tools")
+    if reasoning_effort and reasoning_effort != 'low':
+        capabilities_required.append("reasoning")
+    
+    # Use smart retry if enabled and not streaming
+    if use_smart_retry and not stream:
+        async def llm_call_func(**kwargs):
+            """Wrapper function for LLM call."""
+            params = prepare_params(**kwargs)
+            return await litellm.acompletion(**params)
+        
         try:
-            logger.debug(f"Attempt {attempt + 1}/{MAX_RETRIES}")
-            # logger.debug(f"API request parameters: {json.dumps(params, indent=2)}")
-
-            response = await litellm.acompletion(**params)
-            logger.debug(f"Successfully received API response from {model_name}")
-            # logger.debug(f"Response: {response}")
-            return response
-
-        except (litellm.exceptions.RateLimitError, OpenAIError, json.JSONDecodeError) as e:
-            last_error = e
-            await handle_error(e, attempt, MAX_RETRIES)
-
+            result = await execute_with_smart_retry(
+                request_id=request_id,
+                llm_call=llm_call_func,
+                model_name=model_name,
+                priority=priority or RequestPriority.NORMAL,
+                capabilities_required=capabilities_required,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                api_key=api_key,
+                api_base=api_base,
+                stream=stream,
+                top_p=top_p,
+                model_id=model_id,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort
+            )
+            
+            logger.debug(f"Successfully received API response from smart retry (Request ID: {request_id})")
+            return result
+            
         except Exception as e:
-            logger.error(f"Unexpected error during API call: {str(e)}", exc_info=True)
+            logger.error(f"Smart retry failed for request {request_id}: {str(e)}", exc_info=True)
             raise LLMError(f"API call failed: {str(e)}")
+    
+    else:
+        # Fall back to original retry logic for streaming or when smart retry is disabled
+        params = prepare_params(
+            messages=messages,
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=response_format,
+            tools=tools,
+            tool_choice=tool_choice,
+            api_key=api_key,
+            api_base=api_base,
+            stream=stream,
+            top_p=top_p,
+            model_id=model_id,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort
+        )
+        
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                logger.debug(f"Attempt {attempt + 1}/{MAX_RETRIES} (Request ID: {request_id})")
+                
+                response = await litellm.acompletion(**params)
+                logger.debug(f"Successfully received API response from {model_name} (Request ID: {request_id})")
+                return response
 
-    error_msg = f"Failed to make API call after {MAX_RETRIES} attempts"
-    if last_error:
-        error_msg += f". Last error: {str(last_error)}"
-    logger.error(error_msg, exc_info=True)
-    raise LLMRetryError(error_msg)
+            except (litellm.exceptions.RateLimitError, OpenAIError, json.JSONDecodeError) as e:
+                last_error = e
+                await handle_error(e, attempt, MAX_RETRIES)
 
-# Initialize API keys on module import
+            except Exception as e:
+                logger.error(f"Unexpected error during API call: {str(e)}", exc_info=True)
+                raise LLMError(f"API call failed: {str(e)}")
+
+        error_msg = f"Failed to make API call after {MAX_RETRIES} attempts (Request ID: {request_id})"
+        if last_error:
+            error_msg += f". Last error: {str(last_error)}"
+        logger.error(error_msg, exc_info=True)
+        raise LLMRetryError(error_msg)
+
+# Initialize API keys and retry manager on module import
 setup_api_keys()
+
+# Initialize smart retry manager with configuration
+retry_config = RetryConfig(
+    max_attempts=int(os.getenv("LLM_MAX_RETRY_ATTEMPTS", "3")),
+    base_delay=float(os.getenv("LLM_BASE_RETRY_DELAY", "1.0")),
+    max_delay=float(os.getenv("LLM_MAX_RETRY_DELAY", "30.0")),
+    cost_limit_per_request=float(os.getenv("LLM_COST_LIMIT_PER_REQUEST", "10.0")),
+    rate_limit_delay=float(os.getenv("LLM_RATE_LIMIT_DELAY", "30.0")),
+    timeout_retry_count=int(os.getenv("LLM_TIMEOUT_RETRY_COUNT", "2")),
+    network_retry_count=int(os.getenv("LLM_NETWORK_RETRY_COUNT", "3"))
+)
+initialize_retry_manager(retry_config)

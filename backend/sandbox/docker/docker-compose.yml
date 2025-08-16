@@ -1,5 +1,5 @@
 services:
-  kortix-suna:
+  willow-sandbox:
     platform: linux/amd64
     build:
       context: .

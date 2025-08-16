@@ -1,4 +1,5 @@
 import os
+import asyncio
 import urllib.parse
 from typing import Optional
 
@@ -7,7 +8,11 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from daytona_sdk import AsyncSandbox
 
-from sandbox.sandbox import get_or_start_sandbox, delete_sandbox
+from sandbox.sandbox import get_or_start_sandbox, delete_sandbox, daytona
+from sandbox.health_check import (
+    initialize_health_monitoring, get_health_checker, get_monitor,
+    SandboxHealthStatus, SandboxHealthReport
+)
 from utils.logger import logger
 from utils.auth_utils import get_optional_user_id
 from services.supabase import DBConnection
@@ -20,6 +25,14 @@ def initialize(_db: DBConnection):
     """Initialize the sandbox API with resources from the main API."""
     global db
     db = _db
+    
+    # Initialize health monitoring
+    try:
+        initialize_health_monitoring(daytona)
+        logger.info("Initialized sandbox health monitoring")
+    except Exception as e:
+        logger.error(f"Failed to initialize sandbox health monitoring: {e}")
+    
     logger.info("Initialized sandbox API with database connection")
 
 class FileInfo(BaseModel):
@@ -389,3 +402,219 @@ async def ensure_project_sandbox_active(
     except Exception as e:
         logger.error(f"Error ensuring sandbox is active for project {project_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============= Health Check Endpoints =============
+
+@router.get("/sandboxes/{sandbox_id}/health")
+async def check_sandbox_health(
+    sandbox_id: str,
+    detailed: bool = False,
+    user_id: Optional[str] = Depends(get_optional_user_id)
+):
+    """
+    Check the health status of a sandbox.
+    
+    Args:
+        sandbox_id: ID of the sandbox to check
+        detailed: Whether to include detailed service and resource checks
+        user_id: Optional user ID for authorization
+        
+    Returns:
+        Health report with status, connectivity, services, and resources
+    """
+    client = await db.client
+    
+    # Verify access
+    await verify_sandbox_access(client, sandbox_id, user_id)
+    
+    health_checker = get_health_checker()
+    if not health_checker:
+        raise HTTPException(
+            status_code=503,
+            detail="Health monitoring service not available"
+        )
+    
+    try:
+        report = await health_checker.check_sandbox_health(
+            sandbox_id,
+            detailed=detailed,
+            use_cache=False  # Always get fresh health data for explicit checks
+        )
+        
+        return report.to_dict()
+    except Exception as e:
+        logger.error(f"Error checking health of sandbox {sandbox_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to check sandbox health: {str(e)}"
+        )
+
+
+@router.post("/sandboxes/{sandbox_id}/health/monitor")
+async def start_sandbox_monitoring(
+    sandbox_id: str,
+    interval: int = 60,
+    auto_recover: bool = True,
+    user_id: Optional[str] = Depends(get_optional_user_id)
+):
+    """
+    Start automatic health monitoring for a sandbox.
+    
+    Args:
+        sandbox_id: ID of the sandbox to monitor
+        interval: Health check interval in seconds (default: 60)
+        auto_recover: Whether to automatically attempt recovery (default: true)
+        user_id: Optional user ID for authorization
+        
+    Returns:
+        Confirmation of monitoring activation
+    """
+    client = await db.client
+    
+    # Verify access
+    await verify_sandbox_access(client, sandbox_id, user_id)
+    
+    monitor = get_monitor()
+    if not monitor:
+        raise HTTPException(
+            status_code=503,
+            detail="Health monitoring service not available"
+        )
+    
+    try:
+        await monitor.start_monitoring(
+            sandbox_id,
+            interval=interval,
+            auto_recover=auto_recover
+        )
+        
+        return {
+            "status": "monitoring_started",
+            "sandbox_id": sandbox_id,
+            "interval": interval,
+            "auto_recover": auto_recover
+        }
+    except Exception as e:
+        logger.error(f"Error starting monitoring for sandbox {sandbox_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start monitoring: {str(e)}"
+        )
+
+
+@router.delete("/sandboxes/{sandbox_id}/health/monitor")
+async def stop_sandbox_monitoring(
+    sandbox_id: str,
+    user_id: Optional[str] = Depends(get_optional_user_id)
+):
+    """
+    Stop automatic health monitoring for a sandbox.
+    
+    Args:
+        sandbox_id: ID of the sandbox to stop monitoring
+        user_id: Optional user ID for authorization
+        
+    Returns:
+        Confirmation of monitoring deactivation
+    """
+    client = await db.client
+    
+    # Verify access
+    await verify_sandbox_access(client, sandbox_id, user_id)
+    
+    monitor = get_monitor()
+    if not monitor:
+        raise HTTPException(
+            status_code=503,
+            detail="Health monitoring service not available"
+        )
+    
+    try:
+        await monitor.stop_monitoring(sandbox_id)
+        
+        return {
+            "status": "monitoring_stopped",
+            "sandbox_id": sandbox_id
+        }
+    except Exception as e:
+        logger.error(f"Error stopping monitoring for sandbox {sandbox_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to stop monitoring: {str(e)}"
+        )
+
+
+@router.post("/sandboxes/{sandbox_id}/health/recover")
+async def recover_sandbox(
+    sandbox_id: str,
+    user_id: Optional[str] = Depends(get_optional_user_id)
+):
+    """
+    Manually trigger recovery for an unhealthy sandbox.
+    
+    Args:
+        sandbox_id: ID of the sandbox to recover
+        user_id: Optional user ID for authorization
+        
+    Returns:
+        Recovery status and new health report
+    """
+    client = await db.client
+    
+    # Verify access
+    await verify_sandbox_access(client, sandbox_id, user_id)
+    
+    health_checker = get_health_checker()
+    if not health_checker:
+        raise HTTPException(
+            status_code=503,
+            detail="Health monitoring service not available"
+        )
+    
+    try:
+        # First check current health
+        initial_report = await health_checker.check_sandbox_health(
+            sandbox_id,
+            detailed=True,
+            use_cache=False
+        )
+        
+        if initial_report.status == SandboxHealthStatus.HEALTHY:
+            return {
+                "status": "already_healthy",
+                "health_report": initial_report.to_dict()
+            }
+        
+        # Attempt recovery
+        logger.info(f"Attempting manual recovery for sandbox {sandbox_id}")
+        
+        # Try to restart the sandbox
+        try:
+            await get_or_start_sandbox(sandbox_id)
+            recovery_successful = True
+        except Exception as e:
+            logger.error(f"Recovery failed for sandbox {sandbox_id}: {e}")
+            recovery_successful = False
+        
+        # Check health after recovery attempt
+        await asyncio.sleep(5)  # Give sandbox time to stabilize
+        final_report = await health_checker.check_sandbox_health(
+            sandbox_id,
+            detailed=True,
+            use_cache=False
+        )
+        
+        return {
+            "status": "recovery_attempted",
+            "recovery_successful": recovery_successful,
+            "initial_health": initial_report.to_dict(),
+            "final_health": final_report.to_dict()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error recovering sandbox {sandbox_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to recover sandbox: {str(e)}"
+        )

@@ -124,8 +124,6 @@ You have the abilixwty to execute operations using both Python and CLI tools:
 - You can use the 'get_data_provider_endpoints' tool to get the endpoints for a specific data provider.
 - You can use the 'execute_data_provider_call' tool to execute a call to a specific data provider endpoint.
 - The data providers are:
-  * linkedin - for LinkedIn data
-  * twitter - for Twitter data
   * zillow - for Zillow data
   * amazon - for Amazon data
   * yahoo_finance - for Yahoo Finance data
@@ -380,8 +378,6 @@ IMPORTANT: Use the `cat` command to view contents of small files (100 kb or less
      * ALWAYS check if a data provider exists for your research topic
      * Use data providers as the primary source when available
      * Data providers offer real-time, accurate data for:
-       - LinkedIn data
-       - Twitter data
        - Zillow data
        - Amazon data
        - Yahoo Finance data
